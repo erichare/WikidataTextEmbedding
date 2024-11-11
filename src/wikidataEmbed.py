@@ -350,7 +350,7 @@ class JinaAIEmbeddings:
         self.query_task = query_task
         self.embedding_dim = embedding_dim
 
-        self.model = AutoModel.from_pretrained("jinaai/jina-embeddings-v3", trust_remote_code=True).to('cuda')
+        self.model = AutoModel.from_pretrained("jinaai/jina-embeddings-v3", trust_remote_code=True).to('mps')
         self.tokenizer = AutoTokenizer.from_pretrained("jinaai/jina-embeddings-v3", trust_remote_code=True)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:

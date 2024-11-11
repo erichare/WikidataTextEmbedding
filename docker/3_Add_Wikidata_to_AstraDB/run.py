@@ -1,57 +1,72 @@
 import sys
-sys.path.append('../src')
+import requests
+import time
+import os
+import pickle
 
-from wikidataDB import Session, WikidataID, WikidataEntity
-from wikidataEmbed import WikidataTextifier, JinaAIEmbeddings
+sys.path.append("../src")
 
-import json
+from wikidataDB import Session, WikidataID, WikidataEntity  # type: ignore
+from wikidataEmbed import WikidataTextifier, JinaAIEmbeddings  # type: ignore
+
 from langchain_astradb import AstraDBVectorStore
 from langchain_core.documents import Document
 from astrapy.info import CollectionVectorServiceOptions
 from transformers import AutoTokenizer
 from tqdm import tqdm
-from langchain_core.documents import Document
-import requests
-import time
-import os
-import pickle
-import torch
+from dotenv import load_dotenv
+from sqlalchemy.sql import func
 
-NVIDIA = os.getenv("NVIDIA", "false").lower() == "true"
-JINA = os.getenv("JINA", "false").lower() == "true"
+
+load_dotenv()
+
+
+# Load the environment variables
+MODEL = os.getenv("MODEL", "nvidia")
 SAMPLE = os.getenv("SAMPLE", "false").lower() == "true"
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 100))
+SAMPLE_SIZE = os.getenv("SAMPLE_SIZE", 1000)
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 500))
 OFFSET = int(os.getenv("OFFSET", 0))
-API_KEY_FILENAME = os.getenv("API_KEY", None)
 COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 
-# Load the Database
+# Error if the collection name is not provided
 if not COLLECTION_NAME:
     raise ValueError("The COLLECTION_NAME environment variable is required")
 
-if not API_KEY_FILENAME:
-    API_KEY_FILENAME = os.listdir("../API_tokens")[0]
-datastax_token = json.load(open(f"../API_tokens/{API_KEY_FILENAME}"))
-ASTRA_DB_DATABASE_ID = datastax_token['ASTRA_DB_DATABASE_ID']
-ASTRA_DB_APPLICATION_TOKEN = datastax_token['ASTRA_DB_APPLICATION_TOKEN']
-ASTRA_DB_API_ENDPOINT = datastax_token["ASTRA_DB_API_ENDPOINT"]
-ASTRA_DB_KEYSPACE = datastax_token["ASTRA_DB_KEYSPACE"]
+# Load the AstraDB environment variables
+ASTRA_DB_APPLICATION_TOKEN = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+ASTRA_DB_API_ENDPOINT = os.getenv("ASTRA_DB_API_ENDPOINT")
+ASTRA_DB_KEYSPACE = os.getenv("ASTRA_DB_KEYSPACE")
 
+# Initialize the textifier
 textifier = WikidataTextifier(with_claim_aliases=False, with_property_aliases=False)
+sample_pkl_path = "../data/Evaluation Data/Sample IDs (EN).pkl"
 
+# Initialize the graph store and tokenizer
 graph_store = None
 tokenizer = None
 max_token_size = None
-if NVIDIA:
-    print("Using the Nvidia model")
-    tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-large-unsupervised', trust_remote_code=True, clean_up_tokenization_spaces=False)
+
+# Initialize the graph store
+if MODEL == "nvidia":
+    print("Using the NVIDIA model")
+
+    # Load the embeddings
+    tokenizer = AutoTokenizer.from_pretrained(
+        "intfloat/e5-large-unsupervised",
+        trust_remote_code=True,
+        clean_up_tokenization_spaces=False,
+        max_length=max_token_size,
+        truncation=True,
+    )
     max_token_size = 500
 
+    # Initialize the collection vector service options
     collection_vector_service_options = CollectionVectorServiceOptions(
-        provider="nvidia",
-        model_name="NV-Embed-QA"
+        provider="nvidia", model_name="NV-Embed-QA"
     )
 
+    # Initialize the graph store
     graph_store = AstraDBVectorStore(
         collection_name=COLLECTION_NAME,
         collection_vector_service_options=collection_vector_service_options,
@@ -61,10 +76,13 @@ if NVIDIA:
     )
 else:
     print("Using the Jina model")
+
+    # Load the embeddings
     embeddings = JinaAIEmbeddings(embedding_dim=1024)
     tokenizer = embeddings.tokenizer
     max_token_size = 1024
 
+    # Initialize the graph store
     graph_store = AstraDBVectorStore(
         collection_name=COLLECTION_NAME,
         embedding=embeddings,
@@ -73,46 +91,115 @@ else:
         namespace=ASTRA_DB_KEYSPACE,
     )
 
+# Assume we aren't sampling
+sample_ids: list[int] = []
+with Session() as session:
+    sample_ids_count = session.query(func.count(WikidataEntity.id)).scalar()
+
 # Load the Sample IDs
-sample_ids = None
 if SAMPLE:
-    sample_ids = pickle.load(open("../data/Evaluation Data/Sample IDs (EN).pkl", "rb"))
-    sample_ids = sample_ids[sample_ids['In Wikipedia']]
+    # Check if the file exists
+    if not os.path.exists(sample_pkl_path):
+        # Load the Sample IDs
+        with Session() as session:
+            # Modify the query to fetch random 100 IDs
+            sample_ids_query = (
+                session.query(WikidataEntity.id)
+                .join(WikidataID, WikidataEntity.id == WikidataID.id)
+                .filter(WikidataID.in_wikipedia)
+                .limit(SAMPLE_SIZE)  # Limit to SAMPLE_SIZE results
+            )
+
+            # Fetch and append IDs to the list
+            for entity in sample_ids_query:
+                sample_ids.append(entity.id)
+    else:
+        # Load the Sample IDs
+        with open(sample_pkl_path, "rb") as f:
+            sample_ids = pickle.load(f)
+
+    sample_ids_count = len(sample_ids)
 
 if __name__ == "__main__":
-    with tqdm(total=9203786) as progressbar:
+    with tqdm(total=sample_ids_count) as progressbar:
         with Session() as session:
-            entities = session.query(WikidataEntity).join(WikidataID, WikidataEntity.id == WikidataID.id).filter(WikidataID.in_wikipedia == True).offset(OFFSET).yield_per(BATCH_SIZE)
+            # Conditionally apply filter based on sample_ids
+            query = (
+                session.query(WikidataEntity)
+                .join(WikidataID, WikidataEntity.id == WikidataID.id)
+                .filter(WikidataID.in_wikipedia)
+            )
+
+            # If sample_ids is non-empty, apply the filter
+            if SAMPLE:
+                query = query.filter(WikidataEntity.id.in_(sample_ids))
+
+            # Apply offset and batch size as required
+            entities = query.offset(OFFSET).yield_per(BATCH_SIZE)
             progressbar.update(OFFSET)
+
+            # Initialize the batch
             doc_batch = []
             ids_batch = []
 
             for entity in entities:
                 progressbar.update(1)
-                if SAMPLE and (entity.id in sample_ids['QID'].values):
-                    chunks = textifier.chunk_text(entity, tokenizer, max_length=max_token_size)
-                    for chunk_i in range(len(chunks)):
-                        doc = Document(page_content=chunks[chunk_i], metadata={"QID": entity.id, "ChunkID": chunk_i+1})
-                        doc_batch.append(doc)
-                        ids_batch.append(f"{entity.id}_{chunk_i+1}")
 
-                        if len(doc_batch) >= BATCH_SIZE:
-                            tqdm.write(progressbar.format_meter(progressbar.n, progressbar.total, progressbar.format_dict["elapsed"])) # tqdm is not wokring in docker compose. This is the alternative
+                # Chunk the text and add to the batch
+                chunks = textifier.chunk_text(
+                    entity, tokenizer, max_length=max_token_size
+                )
+
+                # Add the chunks to the batch
+                for i, chunk in enumerate(chunks):
+
+                    # Create the document
+                    doc = Document(
+                        page_content=chunk,
+                        metadata={
+                            "QID": entity.id,
+                            "ChunkID": i + 1,
+                            "aliases": entity.aliases,
+                            "label": entity.label,
+                            "description": entity.description,
+                        },
+                    )
+
+                    # Add the document to the batch
+                    doc_batch.append(doc)
+                    ids_batch.append(f"{entity.id}_{i + 1}")
+
+                    # If the batch is full, add it to the graph store
+                    if len(doc_batch) < BATCH_SIZE:
+                        continue
+
+                    # Update the progress bar
+                    tqdm.write(
+                        progressbar.format_meter(
+                            progressbar.n,
+                            progressbar.total,
+                            progressbar.format_dict["elapsed"],
+                        )
+                    )  # tqdm is not working in docker compose. This is the alternative
+                    try:
+                        graph_store.add_documents(doc_batch, ids=ids_batch)
+
+                        doc_batch = []
+                        ids_batch = []
+                    except Exception as e:
+                        print(e)
+                        while True:
                             try:
-                                graph_store.add_documents(doc_batch, ids=ids_batch)
-                                torch.cuda.empty_cache()
-                                doc_batch = []
-                                ids_batch = []
+                                # Check for internet connection
+                                response = requests.get(
+                                    "https://www.google.com", timeout=5
+                                )
+                                if response.status_code == 200:
+                                    break
                             except Exception as e:
-                                print(e)
-                                while True:
-                                    try:
-                                        response = requests.get("https://www.google.com", timeout=5)
-                                        if response.status_code == 200:
-                                            break
-                                    except Exception as e:
-                                        print("Waiting for internet connection...")
-                                        time.sleep(5)
+                                print("Waiting for internet connection...")
+                                time.sleep(5)
 
+            # Add the remaining documents
             if len(doc_batch) > 0:
                 graph_store.add_documents(doc_batch, ids=ids_batch)
